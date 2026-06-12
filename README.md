@@ -7,6 +7,22 @@ It reads your GearSwap sets (your whole `addons/GearSwap/data` tree), your live 
 gear, and the equippable items you own, and sends them to ottoswap so the website can show
 and analyze your sets. All the analysis runs in your browser; this addon is just the pipe.
 
+<p align="center">
+  <a href="https://ottoswap.ckmtools.dev">
+    <img src="docs/img/set-detail.png" width="100%"
+         alt="ottoswap set editor — equipment viewer, live stat totals, and owned-gear upgrade suggestions">
+  </a>
+  <br>
+  <em>Open any set to see its stat totals and get upgrade suggestions from gear you already own — augments and all.</em>
+</p>
+
+<p align="center">
+  <img src="docs/img/gallery.png" width="100%"
+       alt="ottoswap gallery — every GearSwap set across all your characters and jobs">
+  <br>
+  <em>Every set across all your characters and jobs, in one place.</em>
+</p>
+
 ## Safety
 
 This addon **only sends data out.** There is deliberately **no inbound command channel** —
@@ -48,9 +64,10 @@ Windower 4 with LuaSec (`ssl.https`) available — the standard install includes
 
 ## Status
 
-Early development. The relay is live at `ottoswapapi.ckmtools.dev`. The addon reads and
-pushes the GearSwap data tree (`/sets`) and live gear (`/push`); the web client that
-consumes them is still being built.
+Live and in active development. The site ([ottoswap.ckmtools.dev](https://ottoswap.ckmtools.dev))
+browses and analyzes your sets today — stat totals, owned-gear upgrade suggestions, augment
+decoding, and set sharing via link. The relay runs on `ottoswapapi.ckmtools.dev`. New features
+are still landing regularly.
 
 ## License
 

@@ -32,9 +32,15 @@ To load it automatically, add `lua load ottoswap-bridge` to your Windower `scrip
 | Command | Description |
 |---|---|
 | `//ottoswap setup <code>` | Pair with the website using a code from ottoswap |
+| `//ottoswap code` | Show your pairing code + a link to pair another device |
 | `//ottoswap push` | Push your current gear now |
-| `//ottoswap status` | Show pairing status |
+| `//ottoswap status` | Show pairing status (incl. your code) |
 | `//ottoswap endpoint <url>` | Override the relay endpoint (advanced) |
+
+Your pairing **persists across sessions** — set up once and the bridge keeps pushing while
+you play. Forgot your code? Run `//ottoswap code`, or open
+`your-ottoswap-code.txt` in the addon folder. The pairing code works on **any device or
+network** — open the link it gives you on your phone/laptop to pair it there too.
 
 ## Requirements
 

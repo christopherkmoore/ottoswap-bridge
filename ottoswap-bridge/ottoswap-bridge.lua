@@ -10,9 +10,11 @@
 -- Setup:  put this `ottoswap-bridge` folder in Windower/addons, then in game:
 --   //lua load ottoswap-bridge
 --   //ottoswap setup <pairing-code>      (the code is shown on the website)
+-- The pairing persists across sessions. Forgot your code? `//ottoswap code` prints it (and a
+-- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.2.0'
+_addon.version = '0.3.0'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -23,6 +25,7 @@ local config = require('config')
 
 local defaults = {
     endpoint = 'https://ottoswapapi.ckmtools.dev',
+    site = 'https://ottoswap.ckmtools.dev',   -- the website (for the pairing link)
     token = '',
     push_interval = 5,    -- min seconds between live snapshots
     sets_interval = 120,  -- min seconds between re-scans of the GearSwap data tree
@@ -35,6 +38,22 @@ local state = {
 }
 
 local function log(msg) windower.add_to_chat(6, '[ottoswap] ' .. msg) end
+
+local function pairing_link() return settings.site .. '/#code/' .. settings.token end
+
+-- Write the pairing code to a plain text file in the addon folder so it's recoverable
+-- outside the game (the config also persists it to data/settings.xml, but this is the
+-- obvious place to look when you forget your code).
+local function write_code_file()
+    if settings.token == '' then return end
+    local path = windower.windower_path .. 'addons/' .. _addon.name .. '/your-ottoswap-code.txt'
+    local f = io.open(path, 'w')
+    if not f then return end
+    f:write('Your ottoswap pairing code: ' .. settings.token .. '\n\n')
+    f:write('Open this link on any device (phone, laptop) to pair it — no IP / same-network needed:\n')
+    f:write(pairing_link() .. '\n')
+    f:close()
+end
 
 -- JSON string with full escaping (handles newlines/quotes/control chars in Lua file text)
 local function json_string(s)
@@ -232,6 +251,17 @@ end
 -- ---------------------------------------------------------------------------
 -- Events
 -- ---------------------------------------------------------------------------
+-- On load, remind you of your code (and keep the recovery file fresh) so a forgotten code
+-- is never a dead end — the pairing persists across sessions, you just need to see it.
+windower.register_event('load', function()
+    if settings.token ~= '' then
+        write_code_file()
+        log('paired with code: ' .. settings.token .. '   (//ottoswap code for the pairing link)')
+    else
+        log('not paired. get a code at ' .. settings.site .. ', then: //ottoswap setup <code>')
+    end
+end)
+
 windower.register_event('incoming chunk', function(id, data)
     if id == 0x061 then state.last_stats_data = data end
 end)
@@ -256,19 +286,35 @@ windower.register_event('addon command', function(command, ...)
         if args[1] then
             settings.token = args[1]
             settings:save()
-            log('paired. sending your sets + gear to ottoswap.')
+            write_code_file()   -- save the code where you can find it again
+            log('paired with code: ' .. settings.token)
+            log('saved to addons/' .. _addon.name .. '/your-ottoswap-code.txt')
+            log('sending your sets + gear to ottoswap.')
             push_sets(true)
             push_live(true)
         else
             log('usage: //ottoswap setup <pairing-code>')
+        end
+    elseif command == 'code' or command == 'mycode' then
+        if settings.token ~= '' then
+            write_code_file()   -- refresh the file in case it was deleted
+            log('your code: ' .. settings.token)
+            log('pair a device: ' .. pairing_link())
+        else
+            log('not paired yet — run //ottoswap setup <code> (the code is on the website)')
         end
     elseif command == 'endpoint' then
         if args[1] then settings.endpoint = args[1]; settings:save(); log('endpoint set to ' .. settings.endpoint) end
     elseif command == 'push' then
         push_sets(true); push_live(true); log('pushed.')
     elseif command == 'status' then
-        log(settings.token ~= '' and ('paired -> ' .. settings.endpoint) or 'not paired')
+        if settings.token ~= '' then
+            log('paired. your code: ' .. settings.token)
+            log('pair a device: ' .. pairing_link())
+        else
+            log('not paired. run //ottoswap setup <code>')
+        end
     else
-        log('commands: setup <code> | push | status | endpoint <url>')
+        log('commands: setup <code> | code | push | status | endpoint <url>')
     end
 end)

@@ -1,4 +1,5 @@
 # Windower addon runtime data — holds the user's pairing token; never commit
 ottoswap-bridge/data/
+ottoswap-bridge/your-ottoswap-code.txt
 *.log
 .DS_Store

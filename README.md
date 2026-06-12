@@ -1,5 +1,8 @@
 # ottoswap-bridge
 
+[![ottoswap](https://img.shields.io/badge/ottoswap-ckmtools.dev-d6c869)](https://ottoswap.ckmtools.dev)
+[![Support](https://img.shields.io/badge/%E2%99%A5-Support-ff5f87)](https://buy.stripe.com/dRm14n03odnj3DV4hGf7i0a)
+
 A thin [Windower](https://www.windower.net/) addon that connects FFXI to
 **[ottoswap](https://ottoswap.ckmtools.dev)** — share, browse, and analyze your GearSwap sets.
 
@@ -68,6 +71,10 @@ Live and in active development. The site ([ottoswap.ckmtools.dev](https://ottosw
 browses and analyzes your sets today — stat totals, owned-gear upgrade suggestions, augment
 decoding, and set sharing via link. The relay runs on `ottoswapapi.ckmtools.dev`. New features
 are still landing regularly.
+
+## Support
+
+ottoswap is free. If it saves you time, you can **[♥ chip in for the server costs](https://buy.stripe.com/dRm14n03odnj3DV4hGf7i0a)** — pay what you want, no account needed. Totally optional.
 
 ## License
 

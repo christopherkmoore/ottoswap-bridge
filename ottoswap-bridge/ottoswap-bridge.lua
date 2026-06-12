@@ -67,7 +67,11 @@ local function http_post(path, body)
     local ok, code = https.request{
         url = settings.endpoint .. path,
         method = 'POST',
-        headers = { ['Content-Type'] = 'application/json', ['Content-Length'] = tostring(#body) },
+        headers = {
+            ['Content-Type'] = 'application/json',
+            ['Content-Length'] = tostring(#body),
+            ['User-Agent'] = 'ottoswap-bridge/' .. _addon.version,
+        },
         source = ltn12.source.string(body),
         sink = ltn12.sink.table(resp),
     }

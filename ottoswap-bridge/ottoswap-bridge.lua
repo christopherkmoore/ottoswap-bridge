@@ -1,18 +1,18 @@
 -- ottoswap-bridge: a thin Windower connector for ottoswap (https://ottoswap.ckmtools.dev).
 --
--- It reads your live equipped gear + the equippable items you own and POSTs them to the
--- ottoswap relay over HTTPS, keyed by a pairing code you get from the website. The website
--- (which runs all the analysis in your browser) then shows and analyzes your sets.
+-- It reads your GearSwap sets (the whole addons/GearSwap/data tree) plus your live equipped
+-- gear and the items you own, and POSTs them to the ottoswap relay over HTTPS, keyed by a
+-- pairing code from the website. All analysis runs in your browser; this addon is just the pipe.
 --
--- SAFETY: this addon only SENDS data OUT. It never receives or executes any command — there
--- is deliberately no inbound command channel. It's open source so you can verify that.
+-- SAFETY: this addon only SENDS data OUT. There is deliberately no inbound command channel —
+-- it cannot receive or run any command on your client. It's open source so you can verify that.
 --
--- Setup:  drop this `ottoswap` folder into Windower/addons, then in game:
---   //lua load ottoswap
+-- Setup:  put this `ottoswap-bridge` folder in Windower/addons, then in game:
+--   //lua load ottoswap-bridge
 --   //ottoswap setup <pairing-code>      (the code is shown on the website)
 
-_addon.name = 'ottoswap'
-_addon.version = '0.1.0'
+_addon.name = 'ottoswap-bridge'
+_addon.version = '0.2.0'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -24,13 +24,26 @@ local config = require('config')
 local defaults = {
     endpoint = 'https://ottoswapapi.ckmtools.dev',
     token = '',
-    push_interval = 5,  -- min seconds between live snapshots
+    push_interval = 5,    -- min seconds between live snapshots
+    sets_interval = 120,  -- min seconds between re-scans of the GearSwap data tree
 }
 local settings = config.load(defaults)
 
-local state = { last_check = 0, last_snapshot = nil, last_stats_data = nil }
+local state = {
+    last_live_check = 0, last_sets_check = 0,
+    last_live = nil, last_sets = nil, last_stats_data = nil,
+}
 
 local function log(msg) windower.add_to_chat(6, '[ottoswap] ' .. msg) end
+
+-- JSON string with full escaping (handles newlines/quotes/control chars in Lua file text)
+local function json_string(s)
+    return '"' .. tostring(s):gsub('[%z\1-\31\\"]', function(c)
+        local e = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r',
+                    ['\t'] = '\\t', ['\b'] = '\\b', ['\f'] = '\\f' }
+        return e[c] or string.format('\\u%04x', c:byte())
+    end) .. '"'
+end
 
 -- windower bag ids a character can equip from
 local gear_bags = {
@@ -46,16 +59,69 @@ local equipment_slots = {
     back = 'back', waist = 'waist', legs = 'legs', feet = 'feet',
 }
 
-local function json_escape(text)
-    return tostring(text):gsub('\\', '\\\\'):gsub('"', '\\"')
+-- ---------------------------------------------------------------------------
+-- HTTPS transport. LuaSec's request is blocking, so we push on change + throttle.
+-- ---------------------------------------------------------------------------
+local function http_post(path, body)
+    local resp = {}
+    local ok, code = https.request{
+        url = settings.endpoint .. path,
+        method = 'POST',
+        headers = { ['Content-Type'] = 'application/json', ['Content-Length'] = tostring(#body) },
+        source = ltn12.source.string(body),
+        sink = ltn12.sink.table(resp),
+    }
+    return ok, code
 end
 
 -- ---------------------------------------------------------------------------
--- Readers (what you own / have equipped / your base stats + skills)
+-- Sets channel: read the entire GearSwap/data tree and push raw file text.
 -- ---------------------------------------------------------------------------
+local function read_file(path)
+    local f = io.open(path, 'r')
+    if not f then return nil end
+    local c = f:read('*a'); f:close()
+    return c
+end
 
--- Decode an item's extdata to a JSON augments array, or nil. Path/RP gear (system 4,
--- Sortie/Odyssey) is forwarded as a raw `xd:` hex token for the web client to decode.
+-- recurse the data dir, collecting every .lua file as relpath -> raw text
+local function collect_sets(dir, prefix, out, depth)
+    if depth > 6 then return end
+    for _, name in ipairs(windower.get_dir(dir) or {}) do
+        local full = dir .. name
+        if windower.dir_exists(full) then
+            collect_sets(full .. '/', prefix .. name .. '/', out, depth + 1)
+        elseif name:sub(-4):lower() == '.lua' then
+            local content = read_file(full)
+            if content then out[prefix .. name] = content end
+        end
+    end
+end
+
+local function build_sets_json()
+    local sets = {}
+    collect_sets(windower.windower_path .. 'addons/GearSwap/data/', '', sets, 0)
+    local parts = {}
+    for relpath, content in pairs(sets) do
+        parts[#parts + 1] = json_string(relpath) .. ':' .. json_string(content)
+    end
+    if #parts == 0 then return nil end
+    return '{' .. table.concat(parts, ',') .. '}'
+end
+
+local function push_sets(force)
+    if settings.token == '' then return end
+    local body = build_sets_json()
+    if not body then return end
+    if not force and body == state.last_sets then return end
+    local ok, code = http_post('/sets/' .. settings.token, body)
+    if ok and (code == 200 or code == 204) then state.last_sets = body
+    elseif force then log('sets push failed (' .. tostring(code) .. ')') end
+end
+
+-- ---------------------------------------------------------------------------
+-- Live channel: equipped gear + equippable bags + base stats/skills.
+-- ---------------------------------------------------------------------------
 local function item_augments_json(item)
     if not item.extdata then return nil end
     local ok, decoded = pcall(extdata.decode, item)
@@ -69,7 +135,7 @@ local function item_augments_json(item)
     if decoded.augments then
         for _, augment in ipairs(decoded.augments) do
             if augment and augment ~= 'none' and augment ~= '' then
-                parts[#parts + 1] = '"' .. json_escape(augment) .. '"'
+                parts[#parts + 1] = json_string(augment)
             end
         end
     end
@@ -77,11 +143,9 @@ local function item_augments_json(item)
     return '[' .. table.concat(parts, ',') .. ']'
 end
 
--- equipment: slot -> {id, augments?}  /  bags: name -> [[id,count,(augments)], ...]
 local function gear_json()
     local all = windower.ffxi.get_items()
     if not all or not all.equipment then return nil end
-
     local equip_parts = {}
     for windower_key, slot_name in pairs(equipment_slots) do
         local index = all.equipment[windower_key]
@@ -96,7 +160,6 @@ local function gear_json()
             end
         end
     end
-
     local bag_parts = {}
     for bag_name, bag_id in pairs(gear_bags) do
         local bag = windower.ffxi.get_items(bag_id)
@@ -113,17 +176,14 @@ local function gear_json()
             bag_parts[#bag_parts + 1] = '"' .. bag_name .. '":[' .. table.concat(item_parts, ',') .. ']'
         end
     end
-
     return '"equipment":{' .. table.concat(equip_parts, ',') .. '},' ..
            '"bags":{' .. table.concat(bag_parts, ',') .. '}'
 end
 
--- Base attributes from the 0x061 "Char Stats" packet (gear-independent: race+job+merits+JP).
 local function u16(data, off) return data:byte(off + 1) + data:byte(off + 2) * 256 end
 local function u32(data, off)
     return data:byte(off + 1) + data:byte(off + 2) * 256 + data:byte(off + 3) * 65536 + data:byte(off + 4) * 16777216
 end
--- Combat/magic skills (includes Master Levels/merits/JP) as a JSON object.
 local function skills_json()
     local p = windower.ffxi.get_player()
     if not p or not p.skills then return '{}' end
@@ -137,9 +197,7 @@ local function stats_json()
     local data = state.last_stats_data
     local player = windower.ffxi.get_player()
     local skills = skills_json()
-    if not data or #data < 0x22 then
-        return '"stats":null,"skills":' .. skills
-    end
+    if not data or #data < 0x22 then return '"stats":null,"skills":' .. skills end
     local s = string.format(
         '{"str":%d,"dex":%d,"vit":%d,"agi":%d,"int":%d,"mnd":%d,"chr":%d,"maxhp":%d,"maxmp":%d,"mainjob":"%s","mainlvl":%d}',
         u16(data, 0x14), u16(data, 0x16), u16(data, 0x18), u16(data, 0x1A),
@@ -149,56 +207,27 @@ local function stats_json()
     return '"stats":' .. s .. ',"skills":' .. skills
 end
 
--- ---------------------------------------------------------------------------
--- Transport: HTTPS POST of one snapshot to the relay, keyed by the pairing token.
--- LuaSec's request is blocking, so we push on change + throttle rather than every frame.
--- TODO: import GearSwap set definitions (read the user's GearSwap data files) — next.
--- ---------------------------------------------------------------------------
-
-local function http_post(path, body)
-    local resp = {}
-    local ok, code = https.request{
-        url = settings.endpoint .. path,
-        method = 'POST',
-        headers = {
-            ['Content-Type'] = 'application/json',
-            ['Content-Length'] = tostring(#body),
-        },
-        source = ltn12.source.string(body),
-        sink = ltn12.sink.table(resp),
-    }
-    return ok, code
-end
-
-local function build_snapshot()
+local function build_live()
     local player = windower.ffxi.get_player()
     if not player then return nil end
     local gear = gear_json()
     if not gear then return nil end
-    return '{"char":"' .. json_escape(player.name) .. '",' ..
-           gear .. ',' .. stats_json() .. '}'
+    return '{"char":' .. json_string(player.name) .. ',' .. gear .. ',' .. stats_json() .. '}'
 end
 
-local function push_snapshot(force)
-    if settings.token == '' then
-        log('not paired — run //ottoswap setup <code> (get the code from the website)')
-        return
-    end
-    local snapshot = build_snapshot()
-    if not snapshot then return end
-    if not force and snapshot == state.last_snapshot then return end  -- nothing changed
-    local ok, code = http_post('/push/' .. settings.token, snapshot)
-    if ok and (code == 200 or code == 204) then
-        state.last_snapshot = snapshot
-    elseif force then
-        log('push failed (' .. tostring(code) .. ')')
-    end
+local function push_live(force)
+    if settings.token == '' then return end
+    local body = build_live()
+    if not body then return end
+    if not force and body == state.last_live then return end
+    local ok, code = http_post('/push/' .. settings.token, body)
+    if ok and (code == 200 or code == 204) then state.last_live = body
+    elseif force then log('live push failed (' .. tostring(code) .. ')') end
 end
 
 -- ---------------------------------------------------------------------------
 -- Events
 -- ---------------------------------------------------------------------------
-
 windower.register_event('incoming chunk', function(id, data)
     if id == 0x061 then state.last_stats_data = data end
 end)
@@ -206,9 +235,14 @@ end)
 windower.register_event('prerender', function()
     if settings.token == '' then return end
     local now = os.clock()
-    if now - state.last_check < settings.push_interval then return end
-    state.last_check = now
-    push_snapshot(false)
+    if now - state.last_live_check >= settings.push_interval then
+        state.last_live_check = now
+        push_live(false)
+    end
+    if now - state.last_sets_check >= settings.sets_interval then
+        state.last_sets_check = now
+        push_sets(false)
+    end
 end)
 
 windower.register_event('addon command', function(command, ...)
@@ -218,16 +252,16 @@ windower.register_event('addon command', function(command, ...)
         if args[1] then
             settings.token = args[1]
             settings:save()
-            log('paired. pushing your gear to ottoswap.')
-            push_snapshot(true)
+            log('paired. sending your sets + gear to ottoswap.')
+            push_sets(true)
+            push_live(true)
         else
             log('usage: //ottoswap setup <pairing-code>')
         end
     elseif command == 'endpoint' then
         if args[1] then settings.endpoint = args[1]; settings:save(); log('endpoint set to ' .. settings.endpoint) end
     elseif command == 'push' then
-        push_snapshot(true)
-        log('pushed.')
+        push_sets(true); push_live(true); log('pushed.')
     elseif command == 'status' then
         log(settings.token ~= '' and ('paired -> ' .. settings.endpoint) or 'not paired')
     else

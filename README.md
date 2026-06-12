@@ -3,27 +3,29 @@
 A thin [Windower](https://www.windower.net/) addon that connects FFXI to
 **[ottoswap](https://ottoswap.ckmtools.dev)** — share, browse, and analyze your GearSwap sets.
 
-It reads your live equipped gear and the equippable items you own, and sends them to
-ottoswap so the website can show and analyze your sets. All the analysis runs in your
-browser; this addon is just the pipe.
+It reads your GearSwap sets (your whole `addons/GearSwap/data` tree), your live equipped
+gear, and the equippable items you own, and sends them to ottoswap so the website can show
+and analyze your sets. All the analysis runs in your browser; this addon is just the pipe.
 
 ## Safety
 
 This addon **only sends data out.** There is deliberately **no inbound command channel** —
 it cannot receive or run any command on your client. It's open source so you can read
-exactly what it does (it's one short file: [`ottoswap/ottoswap.lua`](ottoswap/ottoswap.lua)).
+exactly what it does (it's one short file:
+[`ottoswap-bridge/ottoswap-bridge.lua`](ottoswap-bridge/ottoswap-bridge.lua)).
 
-What it sends: your equipped gear, the items in your equippable bags (inventory/wardrobes),
-and your base stats/skills — keyed to a pairing code you control. Nothing else.
+What it sends: your GearSwap data files (read-only), your equipped gear, the items in your
+equippable bags (inventory/wardrobes), and your base stats/skills — keyed to a pairing code
+you control. Nothing else.
 
 ## Install
 
-1. Copy the `ottoswap` folder into your `Windower/addons` directory.
-2. In game: `//lua load ottoswap`
+1. Copy the `ottoswap-bridge` folder into your `Windower/addons` directory.
+2. In game: `//lua load ottoswap-bridge`
 3. Get a pairing code from [ottoswap.ckmtools.dev](https://ottoswap.ckmtools.dev) and run:
    `//ottoswap setup <pairing-code>`
 
-To load it automatically, add `lua load ottoswap` to your Windower `scripts/init.txt`.
+To load it automatically, add `lua load ottoswap-bridge` to your Windower `scripts/init.txt`.
 
 ## Commands
 
@@ -40,8 +42,9 @@ Windower 4 with LuaSec (`ssl.https`) available — the standard install includes
 
 ## Status
 
-Early development. The hosted relay is being stood up; until then the addon is functional
-but has nothing to talk to. GearSwap set-definition import is the next addition.
+Early development. The relay is live at `ottoswapapi.ckmtools.dev`. The addon reads and
+pushes the GearSwap data tree (`/sets`) and live gear (`/push`); the web client that
+consumes them is still being built.
 
 ## License
 

@@ -1,0 +1,4 @@
+# Windower addon runtime data — holds the user's pairing token; never commit
+ottoswap/data/
+*.log
+.DS_Store

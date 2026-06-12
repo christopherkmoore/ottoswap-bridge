@@ -14,7 +14,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.4.0'
+_addon.version = '0.4.1'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -182,7 +182,10 @@ local function item_augments_json(item)
     local parts = {}
     if decoded.augments then
         for _, augment in ipairs(decoded.augments) do
-            if augment and augment ~= 'none' and augment ~= '' then
+            -- extdata returns a raw "System: N ID: N Val: N" descriptor for augments it can't
+            -- name; it carries no usable stat, so don't forward it.
+            if augment and augment ~= 'none' and augment ~= ''
+               and not augment:match('^System:%s*%d+%s*ID:%s*%d+%s*Val:') then
                 parts[#parts + 1] = json_string(augment)
             end
         end

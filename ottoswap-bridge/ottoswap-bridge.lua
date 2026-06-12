@@ -14,7 +14,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.3.0'
+_addon.version = '0.4.0'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -27,14 +27,14 @@ local defaults = {
     endpoint = 'https://ottoswapapi.ckmtools.dev',
     site = 'https://ottoswap.ckmtools.dev',   -- the website (for the pairing link)
     token = '',
-    push_interval = 5,    -- min seconds between live snapshots
-    sets_interval = 120,  -- min seconds between re-scans of the GearSwap data tree
+    push_interval = 15,    -- seconds between (free, local) checks for an inventory/augment change
+    sets_interval = 300,   -- seconds between re-scans of the GearSwap data tree
 }
 local settings = config.load(defaults)
 
 local state = {
     last_live_check = 0, last_sets_check = 0,
-    last_live = nil, last_sets = nil, last_stats_data = nil,
+    last_live_sig = nil, last_sets = nil, last_stats_data = nil,
 }
 
 local function log(msg) windower.add_to_chat(6, '[ottoswap] ' .. msg) end
@@ -121,12 +121,37 @@ local function collect_sets(dir, prefix, out, depth)
     end
 end
 
+-- FFXI job abbreviations — used to recognize gear files that don't follow the Selindrile
+-- naming the website parses.
+local ffxi_jobs = {
+    war = true, mnk = true, whm = true, blm = true, rdm = true, thf = true, pld = true,
+    drk = true, bst = true, brd = true, rng = true, sam = true, nin = true, drg = true,
+    smn = true, blu = true, cor = true, pup = true, dnc = true, sch = true, geo = true, run = true,
+}
+
+-- The website parses gear files named <Char>_<Job>_Gear.lua. Selindrile files already match and
+-- pass through. Some setups instead lay sets out as <Char>/<job>.lua (just the job as the
+-- filename, optionally with a _gear suffix) — rewrite those so they're recognized. Anything that
+-- isn't a recognizable gear file (globals/includes) is sent untouched (the parser reads it for
+-- cross-file item variables).
+local function normalize_set_path(relpath)
+    if relpath:lower():match('_[a-z]+_gear%.lua$') then return relpath end
+    local char, file = relpath:match('^([^/]+)/([^/]+)%.lua$')
+    if char and file then
+        local job = file:gsub('_[gG][eE][aA][rR]$', '')
+        -- keep the <Char>/ folder so the website's "skip the Selindrile template" filter still
+        -- works (it matches the leading folder), and build the filename the parser expects
+        if ffxi_jobs[job:lower()] then return char .. '/' .. char .. '_' .. job .. '_Gear.lua' end
+    end
+    return relpath
+end
+
 local function build_sets_json()
     local sets = {}
     collect_sets(windower.windower_path .. 'addons/GearSwap/data/', '', sets, 0)
     local parts = {}
     for relpath, content in pairs(sets) do
-        parts[#parts + 1] = json_string(relpath) .. ':' .. json_string(content)
+        parts[#parts + 1] = json_string(normalize_set_path(relpath)) .. ':' .. json_string(content)
     end
     if #parts == 0 then return nil end
     return '{' .. table.concat(parts, ',') .. '}'
@@ -169,6 +194,7 @@ end
 local function gear_json()
     local all = windower.ffxi.get_items()
     if not all or not all.equipment then return nil end
+    local owned = {}   -- id -> augjson ('' if none); drives the slot-independent change signature
     local equip_parts = {}
     for windower_key, slot_name in pairs(equipment_slots) do
         local index = all.equipment[windower_key]
@@ -178,6 +204,7 @@ local function gear_json()
             local item = bag and bag[index]
             if item and item.id and item.id > 0 then
                 local augments = item_augments_json(item)
+                owned[item.id] = augments or ''
                 equip_parts[#equip_parts + 1] = '"' .. slot_name .. '":{"id":' .. item.id ..
                     (augments and (',"augments":' .. augments) or '') .. '}'
             end
@@ -192,6 +219,7 @@ local function gear_json()
                 local item = bag[n]
                 if item and item.id and item.id > 0 then
                     local augments = item_augments_json(item)
+                    owned[item.id] = augments or ''
                     item_parts[#item_parts + 1] = '[' .. item.id .. ',' .. (item.count or 1) ..
                         (augments and (',' .. augments) or '') .. ']'
                 end
@@ -199,8 +227,17 @@ local function gear_json()
             bag_parts[#bag_parts + 1] = '"' .. bag_name .. '":[' .. table.concat(item_parts, ',') .. ']'
         end
     end
-    return '"equipment":{' .. table.concat(equip_parts, ',') .. '},' ..
-           '"bags":{' .. table.concat(bag_parts, ',') .. '}'
+    -- change signature: the SET of owned items + their augments, order/slot-independent. Gear
+    -- swaps during combat just move items between slots/bags, so this stays stable — we only push
+    -- when you actually gain/lose/augment gear (not on every swap). Huge cut to request volume.
+    local ids = {}
+    for id in pairs(owned) do ids[#ids + 1] = id end
+    table.sort(ids)
+    local sig = {}
+    for _, id in ipairs(ids) do sig[#sig + 1] = id .. ':' .. owned[id] end
+    local json = '"equipment":{' .. table.concat(equip_parts, ',') .. '},' ..
+                 '"bags":{' .. table.concat(bag_parts, ',') .. '}'
+    return json, table.concat(sig, ';')
 end
 
 local function u16(data, off) return data:byte(off + 1) + data:byte(off + 2) * 256 end
@@ -233,18 +270,24 @@ end
 local function build_live()
     local player = windower.ffxi.get_player()
     if not player then return nil end
-    local gear = gear_json()
+    local gear, gear_sig = gear_json()
     if not gear then return nil end
-    return '{"char":' .. json_string(player.name) .. ',' .. gear .. ',' .. stats_json() .. '}'
+    local body = '{"char":' .. json_string(player.name) .. ',' .. gear .. ',' .. stats_json() .. '}'
+    -- include job + level in the signature so a job change re-pushes; volatile stats (buffs/food)
+    -- are deliberately excluded so they don't trigger pushes
+    local sig = (gear_sig or '') .. '|' .. tostring(player.main_job) .. tostring(player.main_job_level)
+    return body, sig
 end
 
 local function push_live(force)
     if settings.token == '' then return end
-    local body = build_live()
+    local body, sig = build_live()
     if not body then return end
-    if not force and body == state.last_live then return end
+    -- event-driven: push ONLY when the set of owned items/augments changed (no heartbeat, no
+    -- idle traffic). The local 15s scan is free (it reads the game, not the network).
+    if not force and sig == state.last_live_sig then return end
     local ok, code = http_post('/push/' .. settings.token, body)
-    if ok and (code == 200 or code == 204) then state.last_live = body
+    if ok and (code == 200 or code == 204) then state.last_live_sig = sig
     elseif force then log('live push failed (' .. tostring(code) .. ')') end
 end
 

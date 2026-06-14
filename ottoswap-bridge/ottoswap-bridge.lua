@@ -14,7 +14,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.4.1'
+_addon.version = '0.5.0'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -331,7 +331,10 @@ windower.register_event('addon command', function(command, ...)
     if command == 'setup' or command == 'pair' then
         if args[1] then
             settings.token = args[1]
-            settings:save()
+            -- save to the GLOBAL section ('all'), not the per-character one config defaults to,
+            -- so every character on a multiboxed install inherits the pairing — one //ottoswap
+            -- setup pairs them all (otherwise each box reads a blank token and never pushes).
+            settings:save('all')
             write_code_file()   -- save the code where you can find it again
             log('paired with code: ' .. settings.token)
             log('saved to addons/' .. _addon.name .. '/your-ottoswap-code.txt')
@@ -350,7 +353,7 @@ windower.register_event('addon command', function(command, ...)
             log('not paired yet — run //ottoswap setup <code> (the code is on the website)')
         end
     elseif command == 'endpoint' then
-        if args[1] then settings.endpoint = args[1]; settings:save(); log('endpoint set to ' .. settings.endpoint) end
+        if args[1] then settings.endpoint = args[1]; settings:save('all'); log('endpoint set to ' .. settings.endpoint) end
     elseif command == 'push' then
         push_sets(true); push_live(true); log('pushed.')
     elseif command == 'status' then

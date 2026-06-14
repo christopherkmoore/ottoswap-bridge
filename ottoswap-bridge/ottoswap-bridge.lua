@@ -14,7 +14,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.5.0'
+_addon.version = '0.5.1'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -22,6 +22,7 @@ local https = require('ssl.https')
 local ltn12 = require('ltn12')
 local extdata = require('extdata')
 local config = require('config')
+local res = require('resources')
 
 local defaults = {
     endpoint = 'https://ottoswapapi.ckmtools.dev',
@@ -70,6 +71,16 @@ local gear_bags = {
     wardrobe = 8, wardrobe2 = 10, wardrobe3 = 11, wardrobe4 = 12,
     wardrobe5 = 13, wardrobe6 = 14, wardrobe7 = 15, wardrobe8 = 16,
 }
+-- Only equippable items (Armor/Weapon) belong in the gear snapshot. The inventory bag also
+-- holds consumables, drops, temp items, crystals and currency that churn constantly during play;
+-- if those counted toward the change signature, every loot/use would trigger a network push (and
+-- two KV writes), blowing the relay's daily write budget. Filtering to gear keeps the signature
+-- stable across normal play while still capturing real gear parked in inventory.
+local function is_gear(id)
+    local it = res.items[id]
+    return it and (it.category == 'Armor' or it.category == 'Weapon')
+end
+
 -- windower equipment key -> the slot name the web client uses
 local equipment_slots = {
     main = 'main', sub = 'sub', range = 'range', ammo = 'ammo',
@@ -220,7 +231,7 @@ local function gear_json()
             local item_parts = {}
             for n = 1, (bag.max or 0) do
                 local item = bag[n]
-                if item and item.id and item.id > 0 then
+                if item and item.id and item.id > 0 and is_gear(item.id) then
                     local augments = item_augments_json(item)
                     owned[item.id] = augments or ''
                     item_parts[#item_parts + 1] = '[' .. item.id .. ',' .. (item.count or 1) ..

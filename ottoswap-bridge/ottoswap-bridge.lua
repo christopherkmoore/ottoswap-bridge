@@ -11,7 +11,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.6.3'
+_addon.version = '0.6.4'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -385,7 +385,7 @@ local function build_delta(base_sig, new_sig, prev, cur)
         ',"removed":[' .. table.concat(removed, ',') .. ']}'
 end
 
-local function push_sets(force)
+local function push_sets(force, on_done)   -- on_done() fires after a successful push (full or delta)
     if settings.token == '' then return end
     local manifest = current_manifest()
     local sig = manifest_sig(manifest)
@@ -402,7 +402,7 @@ local function push_sets(force)
         if not body then state.sets_pushing = false; return end
         post('/sets/' .. settings.token, body, function(success, code)
             state.sets_pushing = false
-            if success then save_state(sig, 0, manifest)
+            if success then save_state(sig, 0, manifest); if on_done then on_done() end
             elseif force then log('sets push failed (' .. tostring(code) .. ')') end
         end, 'X-Ottoswap-Sig: ' .. sig .. '\r\n')
     end
@@ -412,7 +412,7 @@ local function push_sets(force)
         local envelope = build_delta(saved.sig, sig, saved.manifest, manifest)
         local since = (saved.since_full or 0) + 1
         post('/sets/' .. settings.token .. '/delta', envelope, function(success, code)
-            if success then state.sets_pushing = false; save_state(sig, since, manifest)
+            if success then state.sets_pushing = false; save_state(sig, since, manifest); if on_done then on_done() end
             elseif code == 409 then full_push()   -- relay rejected (stale/no base/keyset) -> resync with a full push
             else state.sets_pushing = false end
         end)
@@ -614,8 +614,14 @@ local function pull_writes()
     end
     if applied > 0 then
         windower.send_command('gs reload')   -- reload GearSwap so the edits take effect
-        https_post(host, port, '/wb/' .. settings.token .. '/ack', '')   -- clear the queue (idempotent if this is lost)
         log('applied ' .. applied .. ' edit(s), reloaded GearSwap.')
+        -- re-push the changed sets so the relay (and the website) reflect the new gear, then clear
+        -- the queue once the push lands -- the site refreshes off the queue emptying, so acking only
+        -- after the push avoids the website reading stale sets. force-push: a same-size edit wouldn't
+        -- move the size:mtime manifest on installs without lfs, so don't rely on delta detection here.
+        push_sets(true, function()
+            https_post(host, port, '/wb/' .. settings.token .. '/ack', '')   -- idempotent if lost; next pull re-applies
+        end)
     else
         log('no edits applied.')
     end

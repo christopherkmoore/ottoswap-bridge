@@ -51,8 +51,13 @@ To load it automatically, add `lua load ottoswap-bridge` to your Windower `scrip
 | `//ottoswap setup <code>` | Pair with the website using a code from ottoswap |
 | `//ottoswap code` | Show your pairing code + a link to pair another device |
 | `//ottoswap push` | Push your current gear now |
+| `//ottoswap pull` | Apply edits you saved on the website to your GearSwap files (reloads GearSwap) |
 | `//ottoswap status` | Show pairing status (incl. your code) |
 | `//ottoswap endpoint <url>` | Override the relay endpoint (advanced) |
+
+**Editing back into the game:** when you save a change to a set on the website, it's queued for
+you. Run `//ottoswap pull` in FFXI and the bridge writes those edits into your GearSwap `.lua`
+files and reloads GearSwap — so the change you made in the browser takes effect in-game.
 
 Your pairing **persists across sessions** — set up once and the bridge keeps pushing while
 you play. Forgot your code? Run `//ottoswap code`, or open

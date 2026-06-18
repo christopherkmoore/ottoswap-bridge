@@ -11,7 +11,7 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.6.0'
+_addon.version = '0.6.3'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
@@ -106,21 +106,18 @@ local function parse_endpoint(url)
     return scheme, host, (tonumber(port) or (scheme == 'https' and 443 or 80))
 end
 
--- Perform one HTTPS POST. Returns true,code on a parsed HTTP status, or nil,err. Must run inside
--- coroutine.schedule (it yields).
-local function https_post(host, port, path, body, extra_headers)
+-- Open a non-blocking TLS connection (connect + handshake). Returns the wrapped conn or nil,err.
+-- Yields between polls; must run inside coroutine.schedule. Cloudflare requires SNI.
+local function tls_dial(host, port, deadline)
     local conn = socket.tcp()
     if not conn then return nil, 'no socket' end
     conn:settimeout(0)
-    local deadline = socket.gettime() + 30
-
     local ok, err = conn:connect(host, port)
     while not (ok == 1 or err == 'already connected') do
         if socket.gettime() > deadline then conn:close(); return nil, 'connect timeout' end
         coroutine.sleep(YIELD)
         ok, err = conn:connect(host, port)
     end
-
     conn = ssl.wrap(conn, { mode = 'client', protocol = 'any', verify = 'none', options = 'all' })
     conn:settimeout(0)
     if conn.sni then conn:sni(host) end   -- Cloudflare serves many hosts per IP; handshake fails without SNI
@@ -133,21 +130,34 @@ local function https_post(host, port, path, body, extra_headers)
         coroutine.sleep(YIELD)
         handshake_ok, handshake_err = conn:dohandshake()
     end
+    return conn
+end
 
-    local request = 'POST ' .. path .. ' HTTP/1.1\r\nHost: ' .. host ..
-        '\r\nContent-Type: application/json\r\nContent-Length: ' .. #body ..
-        '\r\nUser-Agent: ottoswap-bridge/' .. _addon.version .. '\r\n' .. (extra_headers or '') ..
-        'Connection: close\r\n\r\n' .. body
+-- Send the whole buffer over a non-blocking conn, yielding between partial sends.
+local function send_all(conn, request, deadline)
     local sent = 0
     while sent < #request do
         local last_byte, send_err, partial = conn:send(request, sent + 1)
         if last_byte then sent = last_byte
         elseif send_err == 'timeout' or send_err == 'wantwrite' or send_err == 'wantread' then
             sent = partial or sent; coroutine.sleep(YIELD)
-        else conn:close(); return nil, 'send: ' .. tostring(send_err) end
-        if socket.gettime() > deadline then conn:close(); return nil, 'send timeout' end
+        else return nil, 'send: ' .. tostring(send_err) end
+        if socket.gettime() > deadline then return nil, 'send timeout' end
     end
+    return true
+end
 
+-- HTTPS POST. Returns true,code on a parsed HTTP status, or nil,err. Must run inside coroutine.schedule.
+local function https_post(host, port, path, body, extra_headers)
+    local deadline = socket.gettime() + 30
+    local conn, err = tls_dial(host, port, deadline)
+    if not conn then return nil, err end
+    local request = 'POST ' .. path .. ' HTTP/1.1\r\nHost: ' .. host ..
+        '\r\nContent-Type: application/json\r\nContent-Length: ' .. #body ..
+        '\r\nUser-Agent: ottoswap-bridge/' .. _addon.version .. '\r\n' .. (extra_headers or '') ..
+        'Connection: close\r\n\r\n' .. body
+    local ok, serr = send_all(conn, request, deadline)
+    if not ok then conn:close(); return nil, serr end
     local response = ''   -- only need the status line; the relay commits the write before it responds
     while not response:find('\r\n', 1, true) do
         local data, recv_err, partial = conn:receive(256)
@@ -162,6 +172,31 @@ local function https_post(host, port, path, body, extra_headers)
     local code = tonumber(response:match('HTTP/[%d%.]+ (%d+)'))
     if not code then return nil, 'no status' end
     return true, code
+end
+
+-- HTTPS GET that reads the FULL response body (for //ottoswap pull). Returns code, body or nil,err.
+local function https_get(host, port, path)
+    local deadline = socket.gettime() + 30
+    local conn, err = tls_dial(host, port, deadline)
+    if not conn then return nil, err end
+    local request = 'GET ' .. path .. ' HTTP/1.1\r\nHost: ' .. host ..
+        '\r\nUser-Agent: ottoswap-bridge/' .. _addon.version .. '\r\nConnection: close\r\n\r\n'
+    local ok, serr = send_all(conn, request, deadline)
+    if not ok then conn:close(); return nil, serr end
+    local resp = ''   -- read until the server closes (relay sends Connection: close)
+    while true do
+        local data, recv_err, partial = conn:receive(4096)
+        if data then resp = resp .. data
+        elseif recv_err == 'closed' then resp = resp .. (partial or ''); break
+        elseif recv_err == 'timeout' or recv_err == 'wantread' or recv_err == 'wantwrite' then
+            resp = resp .. (partial or ''); coroutine.sleep(YIELD)
+        else conn:close(); return nil, 'recv: ' .. tostring(recv_err) end
+        if socket.gettime() > deadline then conn:close(); return nil, 'recv timeout' end
+    end
+    conn:close()
+    local code = tonumber(resp:match('HTTP/[%d%.]+ (%d+)'))
+    local body = resp:match('\r\n\r\n(.*)$') or ''
+    return code, body
 end
 
 -- Post in the background: schedule the upload as a coroutine so prerender returns instantly, then
@@ -520,6 +555,73 @@ local function push_live(force)
 end
 
 -- ---------------------------------------------------------------------------
+-- Write-back: apply edits made on the website, pulled on the user's explicit //ottoswap pull.
+-- ---------------------------------------------------------------------------
+-- Parse the relay's length-prefixed pending-writes body: "<path>\n<bytelen>\n<raw content>" per file.
+local function parse_writes(body)
+    local writes, pos, n = {}, 1, #body
+    while pos <= n do
+        local nl1 = body:find('\n', pos, true)
+        if not nl1 then break end
+        local relpath = body:sub(pos, nl1 - 1)
+        local nl2 = body:find('\n', nl1 + 1, true)
+        if not nl2 then break end
+        local len = tonumber(body:sub(nl1 + 1, nl2 - 1))
+        if not len then break end
+        writes[#writes + 1] = { path = relpath, content = body:sub(nl2 + 1, nl2 + len) }
+        pos = nl2 + 1 + len
+    end
+    return writes
+end
+
+-- Write one edited file to its REAL on-disk path (the caller resolves the website key -> the real
+-- file from the current scan, so no layout is assumed). Re-validates the path (the relay checks
+-- too): a plain relative .lua under the data tree, never a traversal or absolute path. Keeps a
+-- single rolling rollback copy in the bridge's OWN data folder — overwritten each time so it never
+-- accumulates, and never under GearSwap/data so it's never synced.
+local function apply_write(relpath, content)
+    if not relpath:match('^[%w _%.%-/]+%.lua$') or relpath:find('%.%.') or relpath:sub(1, 1) == '/' then
+        log('skipped unsafe path: ' .. tostring(relpath)); return false
+    end
+    local full = windower.windower_path .. 'addons/GearSwap/data/' .. relpath
+    local existing = read_file(full)
+    if existing then
+        local bakname = relpath:gsub('[/\\]', '#')   -- flatten to one file per set, no subdirs
+        local bak = io.open(windower.windower_path .. 'addons/' .. _addon.name .. '/data/wb-rollback-' .. bakname, 'w')
+        if bak then bak:write(existing); bak:close() end   -- overwrites the previous rollback of this file
+    end
+    local f = io.open(full, 'w')
+    if not f then log('write failed: ' .. relpath); return false end
+    f:write(content); f:close()
+    return true
+end
+
+-- The //ottoswap pull worker (runs as a coroutine — its network calls yield).
+local function pull_writes()
+    local scheme, host, port = parse_endpoint(settings.endpoint)
+    if not scheme then log('bad endpoint'); return end
+    local code, body = https_get(host, port, '/wb/' .. settings.token)
+    if code ~= 200 then log('pull failed (' .. tostring(code) .. ')'); return end
+    local writes = parse_writes(body or '')
+    if #writes == 0 then log('no pending edits.'); return end
+    -- resolve each website-facing key back to the REAL file in this player's tree (dynamic, no
+    -- assumed layout): map normalize_set_path(rawfile) -> rawfile from a fresh scan.
+    local resolve = {}
+    for raw in pairs(current_manifest()) do resolve[normalize_set_path(raw)] = raw end
+    local applied = 0
+    for _, w in ipairs(writes) do
+        if apply_write(resolve[w.path] or w.path, w.content) then applied = applied + 1 end
+    end
+    if applied > 0 then
+        windower.send_command('gs reload')   -- reload GearSwap so the edits take effect
+        https_post(host, port, '/wb/' .. settings.token .. '/ack', '')   -- clear the queue (idempotent if this is lost)
+        log('applied ' .. applied .. ' edit(s), reloaded GearSwap.')
+    else
+        log('no edits applied.')
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Events
 -- ---------------------------------------------------------------------------
 -- On load, remind you of your code (and keep the recovery file fresh) so a forgotten code
@@ -530,7 +632,7 @@ windower.register_event('load', function()
     state.last_sets_check = os.clock() - settings.sets_interval + 2 + math.random() * 18
     if settings.token ~= '' then
         write_code_file()
-        log('paired with code: ' .. settings.token .. '   (//ottoswap code for the pairing link)')
+        log('v' .. _addon.version .. ' paired with code: ' .. settings.token .. '   (//ottoswap code for the pairing link)')
     else
         log('not paired. get a code at ' .. settings.site .. ', then: //ottoswap setup <code>')
     end
@@ -584,6 +686,13 @@ windower.register_event('addon command', function(command, ...)
         if args[1] then settings.endpoint = args[1]; settings:save('all'); log('endpoint set to ' .. settings.endpoint) end
     elseif command == 'push' then
         push_sets(true); push_live(true); log('pushed.')
+    elseif command == 'pull' then
+        if settings.token == '' then
+            log('not paired. run //ottoswap setup <code>')
+        else
+            log('checking ottoswap for edits to apply...')
+            coroutine.schedule(pull_writes, 0)
+        end
     elseif command == 'status' then
         if settings.token ~= '' then
             log('paired. your code: ' .. settings.token)
@@ -592,6 +701,6 @@ windower.register_event('addon command', function(command, ...)
             log('not paired. run //ottoswap setup <code>')
         end
     else
-        log('commands: setup <code> | code | push | status | endpoint <url>')
+        log('commands: setup <code> | code | push | pull | status | endpoint <url>')
     end
 end)

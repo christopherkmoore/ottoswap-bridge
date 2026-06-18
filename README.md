@@ -26,16 +26,14 @@ and analyze your sets. All the analysis runs in your browser; this addon is just
   <em>Every set across all your characters and jobs, in one place.</em>
 </p>
 
-## Safety
+## What it shares
 
-This addon **only sends data out.** There is deliberately **no inbound command channel** —
-it cannot receive or run any command on your client. It's open source so you can read
-exactly what it does (it's one short file:
-[`ottoswap-bridge/ottoswap-bridge.lua`](ottoswap-bridge/ottoswap-bridge.lua)).
+ottoswap-bridge syncs your GearSwap data with ottoswap, keyed to a pairing code you control.
+It's open source — one short file
+([`ottoswap-bridge/ottoswap-bridge.lua`](ottoswap-bridge/ottoswap-bridge.lua)) you can read.
 
-What it sends: your GearSwap data files (read-only), your equipped gear, the items in your
-equippable bags (inventory/wardrobes), and your base stats/skills — keyed to a pairing code
-you control. Nothing else.
+What it handles: your GearSwap data files, your equipped gear, the items in your equippable
+bags (inventory/wardrobes), and your base stats/skills.
 
 ## Install
 

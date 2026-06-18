@@ -4,9 +4,6 @@
 -- gear and the items you own, and POSTs them to the ottoswap relay over HTTPS, keyed by a
 -- pairing code from the website. All analysis runs in your browser; this addon is just the pipe.
 --
--- SAFETY: this addon only SENDS data OUT. There is deliberately no inbound command channel —
--- it cannot receive or run any command on your client. It's open source so you can verify that.
---
 -- Setup:  put this `ottoswap-bridge` folder in Windower/addons, then in game:
 --   //lua load ottoswap-bridge
 --   //ottoswap setup <pairing-code>      (the code is shown on the website)

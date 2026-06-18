@@ -11,28 +11,29 @@
 -- link to pair other devices), and it's saved to `your-ottoswap-code.txt` in this folder.
 
 _addon.name = 'ottoswap-bridge'
-_addon.version = '0.5.1'
+_addon.version = '0.6.0'
 _addon.author = 'ckm'
 _addon.commands = {'ottoswap'}
 
-local https = require('ssl.https')
-local ltn12 = require('ltn12')
+local socket = require('socket')           -- luasocket core: tcp() + high-res gettime()
+local ssl = require('ssl')                 -- LuaSec core: ssl.wrap / dohandshake for the non-blocking upload
 local extdata = require('extdata')
 local config = require('config')
 local res = require('resources')
+local lfs_ok, lfs = pcall(require, 'lfs')  -- optional: gives file mtime for change-detection; falls back to size
 
 local defaults = {
     endpoint = 'https://ottoswapapi.ckmtools.dev',
     site = 'https://ottoswap.ckmtools.dev',   -- the website (for the pairing link)
     token = '',
-    push_interval = 15,    -- seconds between (free, local) checks for an inventory/augment change
-    sets_interval = 300,   -- seconds between re-scans of the GearSwap data tree
+    push_interval = 30,    -- seconds between (cheap, local) scans for an inventory/augment change
+    sets_interval = 600,   -- seconds between (cheap, stat-only) scans of the GearSwap data tree
 }
 local settings = config.load(defaults)
 
 local state = {
     last_live_check = 0, last_sets_check = 0,
-    last_live_sig = nil, last_sets = nil, last_stats_data = nil,
+    last_live_sig = nil, last_stats_data = nil,
 }
 
 local function log(msg) windower.add_to_chat(6, '[ottoswap] ' .. msg) end
@@ -87,22 +88,91 @@ local equipment_slots = {
 }
 
 -- ---------------------------------------------------------------------------
--- HTTPS transport. LuaSec's request is blocking, so we push on change + throttle.
+-- HTTPS transport. The upload runs inside a Windower coroutine on a non-blocking socket
+-- (settimeout(0)), yielding a frame (coroutine.sleep(YIELD)) between polls — so even a multi-MB
+-- push never drops a render frame, and it's far faster than ltn12's tiny default chunking because
+-- it sends the whole buffer in big writes. Validated against this LuaJIT/LuaSec build: connect
+-- completes as err='already connected'; Cloudflare requires conn:sni(host); negotiates TLSv1.3.
+-- Stays Lua 5.1/LuaJIT-safe: never yields across pcall, and never error()s on the hot path (a dead
+-- coroutine must not strand an in-flight flag — every failure path returns).
 -- ---------------------------------------------------------------------------
-local function http_post(path, body)
-    local resp = {}
-    local ok, code = https.request{
-        url = settings.endpoint .. path,
-        method = 'POST',
-        headers = {
-            ['Content-Type'] = 'application/json',
-            ['Content-Length'] = tostring(#body),
-            ['User-Agent'] = 'ottoswap-bridge/' .. _addon.version,
-        },
-        source = ltn12.source.string(body),
-        sink = ltn12.sink.table(resp),
-    }
-    return ok, code
+local YIELD = 0.02   -- positive sleep between polls so the scheduler renders a frame between them;
+                     -- sleep(0) busy-spins and would freeze the client (proven via the probe).
+
+local function parse_endpoint(url)
+    local scheme, hostport = tostring(url):match('^(%w+)://([^/]+)')
+    if not scheme then return nil end
+    local host, port = hostport:match('^([^:]+):?(%d*)$')
+    return scheme, host, (tonumber(port) or (scheme == 'https' and 443 or 80))
+end
+
+-- Perform one HTTPS POST. Returns true,code on a parsed HTTP status, or nil,err. Must run inside
+-- coroutine.schedule (it yields).
+local function https_post(host, port, path, body, extra_headers)
+    local conn = socket.tcp()
+    if not conn then return nil, 'no socket' end
+    conn:settimeout(0)
+    local deadline = socket.gettime() + 30
+
+    local ok, err = conn:connect(host, port)
+    while not (ok == 1 or err == 'already connected') do
+        if socket.gettime() > deadline then conn:close(); return nil, 'connect timeout' end
+        coroutine.sleep(YIELD)
+        ok, err = conn:connect(host, port)
+    end
+
+    conn = ssl.wrap(conn, { mode = 'client', protocol = 'any', verify = 'none', options = 'all' })
+    conn:settimeout(0)
+    if conn.sni then conn:sni(host) end   -- Cloudflare serves many hosts per IP; handshake fails without SNI
+    local handshake_ok, handshake_err = conn:dohandshake()
+    while not handshake_ok do
+        if not (handshake_err == 'wantread' or handshake_err == 'wantwrite' or handshake_err == 'timeout') then
+            conn:close(); return nil, 'tls: ' .. tostring(handshake_err)
+        end
+        if socket.gettime() > deadline then conn:close(); return nil, 'tls timeout' end
+        coroutine.sleep(YIELD)
+        handshake_ok, handshake_err = conn:dohandshake()
+    end
+
+    local request = 'POST ' .. path .. ' HTTP/1.1\r\nHost: ' .. host ..
+        '\r\nContent-Type: application/json\r\nContent-Length: ' .. #body ..
+        '\r\nUser-Agent: ottoswap-bridge/' .. _addon.version .. '\r\n' .. (extra_headers or '') ..
+        'Connection: close\r\n\r\n' .. body
+    local sent = 0
+    while sent < #request do
+        local last_byte, send_err, partial = conn:send(request, sent + 1)
+        if last_byte then sent = last_byte
+        elseif send_err == 'timeout' or send_err == 'wantwrite' or send_err == 'wantread' then
+            sent = partial or sent; coroutine.sleep(YIELD)
+        else conn:close(); return nil, 'send: ' .. tostring(send_err) end
+        if socket.gettime() > deadline then conn:close(); return nil, 'send timeout' end
+    end
+
+    local response = ''   -- only need the status line; the relay commits the write before it responds
+    while not response:find('\r\n', 1, true) do
+        local data, recv_err, partial = conn:receive(256)
+        if data then response = response .. data
+        elseif recv_err == 'closed' then response = response .. (partial or ''); break
+        elseif recv_err == 'timeout' or recv_err == 'wantread' or recv_err == 'wantwrite' then
+            response = response .. (partial or ''); coroutine.sleep(YIELD)
+        else conn:close(); return nil, 'recv: ' .. tostring(recv_err) end
+        if socket.gettime() > deadline then conn:close(); return nil, 'recv timeout' end
+    end
+    conn:close()
+    local code = tonumber(response:match('HTTP/[%d%.]+ (%d+)'))
+    if not code then return nil, 'no status' end
+    return true, code
+end
+
+-- Post in the background: schedule the upload as a coroutine so prerender returns instantly, then
+-- invoke on_done(success, code) when it finishes. success already folds in the 200/204 check.
+local function post(path, body, on_done, extra_headers)
+    local scheme, host, port = parse_endpoint(settings.endpoint)
+    if not scheme then on_done(false, 'bad endpoint'); return end
+    coroutine.schedule(function()
+        local ok, code = https_post(host, port, path, body, extra_headers)
+        on_done(ok and (code == 200 or code == 204), code)
+    end, 0)
 end
 
 -- ---------------------------------------------------------------------------
@@ -165,14 +235,155 @@ local function build_sets_json()
     return '{' .. table.concat(parts, ',') .. '}'
 end
 
+-- Change-detection + delta. Walk the data tree into a manifest map (relpath -> "size:mtime") using
+-- stats only — no content read. A change re-reads only the files that actually changed and pushes a
+-- small delta of just those, instead of the whole ~1.7MB tree. State (the manifest + a version sig)
+-- is shared across the 6 co-located instances via data/.sets-state, so a sibling's push dedups the
+-- rest. Augments are unaffected — they ride the live channel's extdata, not these files.
+local function file_stat(path)
+    if lfs_ok then
+        local a = lfs.attributes(path)
+        if a then return a.size, a.modification end
+    end
+    local f = io.open(path, 'r')
+    if not f then return nil end
+    local size = f:seek('end')   -- size without reading the body
+    f:close()
+    return size, nil
+end
+
+local function scan_manifest(dir, prefix, acc, depth)
+    if depth > 6 then return end
+    for _, name in ipairs(windower.get_dir(dir) or {}) do
+        local full = dir .. name
+        if windower.dir_exists(full) then
+            scan_manifest(full .. '/', prefix .. name .. '/', acc, depth + 1)
+        elseif name:sub(-4):lower() == '.lua' then
+            local size, mtime = file_stat(full)
+            if size then acc[prefix .. name] = size .. ':' .. (mtime or '?') end
+        end
+    end
+end
+local function current_manifest()
+    local m = {}
+    scan_manifest(windower.windower_path .. 'addons/GearSwap/data/', '', m, 0)
+    return m
+end
+
+-- djb2 hash of the sorted manifest -> short version token. The relay stores it opaquely as the
+-- delta "base"; any content edit changes a file's size/mtime, so the token changes too.
+local function manifest_sig(m)
+    local keys = {}
+    for k in pairs(m) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local h = 5381
+    for _, k in ipairs(keys) do
+        local line = k .. ':' .. m[k] .. '\n'
+        for i = 1, #line do h = (h * 33 + line:byte(i)) % 4294967296 end
+    end
+    return string.format('%08x', h)
+end
+
+-- Persisted state (shared across instances): data/.sets-state. Line 1 sig=<token>, line 2
+-- since_full=<n> (deltas since the last full push), then one "relpath:size:mtime" line per file.
+local function state_path()
+    return windower.windower_path .. 'addons/' .. _addon.name .. '/data/.sets-state'
+end
+local function load_state()
+    local f = io.open(state_path(), 'r')
+    if not f then return nil end
+    local content = f:read('*a'); f:close()
+    if not content or content == '' then return nil end
+    local sig, since_full, manifest = nil, 0, {}
+    for line in content:gmatch('[^\n]+') do
+        if line:sub(1, 4) == 'sig=' then sig = line:sub(5)
+        elseif line:sub(1, 11) == 'since_full=' then since_full = tonumber(line:sub(12)) or 0
+        else
+            local relpath, sm = line:match('^([^:]+):(.+)$')   -- relpath has no ':'; sm = "size:mtime"
+            if relpath then manifest[relpath] = sm end
+        end
+    end
+    if not sig then return nil end
+    return { sig = sig, since_full = since_full, manifest = manifest }
+end
+local function save_state(sig, since_full, manifest)
+    local f = io.open(state_path(), 'w')
+    if not f then return end
+    f:write('sig=' .. sig .. '\nsince_full=' .. since_full .. '\n')
+    local keys = {}
+    for k in pairs(manifest) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do f:write(k .. ':' .. manifest[k] .. '\n') end
+    f:close()
+end
+
+local RECONCILE_EVERY = 50   -- force a full push every N deltas as a ground-truth backstop
+
+-- Build the delta envelope: changed/added file CONTENTS + removed keys, plus the full expected
+-- normalized key-set for the relay's integrity cross-check. Reads only the changed files.
+local function build_delta(base_sig, new_sig, prev, cur)
+    local data_dir = windower.windower_path .. 'addons/GearSwap/data/'
+    local cur_keys = {}   -- normalized key -> true (the resulting key-set)
+    for raw in pairs(cur) do cur_keys[normalize_set_path(raw)] = true end
+    local changed = {}
+    for raw, sm in pairs(cur) do
+        if prev[raw] ~= sm then
+            local content = read_file(data_dir .. raw)
+            if content then changed[#changed + 1] = json_string(normalize_set_path(raw)) .. ':' .. json_string(content) end
+        end
+    end
+    local removed = {}
+    for raw in pairs(prev) do
+        if not cur[raw] then
+            local nk = normalize_set_path(raw)
+            if not cur_keys[nk] then removed[#removed + 1] = json_string(nk) end   -- only if no current file maps to it
+        end
+    end
+    local keys = {}
+    for nk in pairs(cur_keys) do keys[#keys + 1] = nk end
+    table.sort(keys)
+    local key_parts = {}
+    for _, nk in ipairs(keys) do key_parts[#key_parts + 1] = json_string(nk) end
+    return '{"base":' .. json_string(base_sig) .. ',"sig":' .. json_string(new_sig) ..
+        ',"keys":[' .. table.concat(key_parts, ',') .. ']' ..
+        ',"changed":{' .. table.concat(changed, ',') .. '}' ..
+        ',"removed":[' .. table.concat(removed, ',') .. ']}'
+end
+
 local function push_sets(force)
     if settings.token == '' then return end
-    local body = build_sets_json()
-    if not body then return end
-    if not force and body == state.last_sets then return end
-    local ok, code = http_post('/sets/' .. settings.token, body)
-    if ok and (code == 200 or code == 204) then state.last_sets = body
-    elseif force then log('sets push failed (' .. tostring(code) .. ')') end
+    local manifest = current_manifest()
+    local sig = manifest_sig(manifest)
+    local saved = load_state()   -- shared file; a sibling instance's push dedups the rest
+    if not force and saved and saved.sig == sig then return end   -- nothing changed
+    -- watchdog: clear a stuck in-flight flag if a prior push coroutine died without completing
+    if state.sets_pushing and (os.time() - (state.sets_push_started or 0)) > 90 then state.sets_pushing = false end
+    if state.sets_pushing then return end   -- a push is already in flight; the next scan retries
+    state.sets_pushing = true
+    state.sets_push_started = os.time()
+
+    local function full_push()
+        local body = build_sets_json()
+        if not body then state.sets_pushing = false; return end
+        post('/sets/' .. settings.token, body, function(success, code)
+            state.sets_pushing = false
+            if success then save_state(sig, 0, manifest)
+            elseif force then log('sets push failed (' .. tostring(code) .. ')') end
+        end, 'X-Ottoswap-Sig: ' .. sig .. '\r\n')
+    end
+
+    -- delta when we have a base, haven't hit the reconcile interval, and aren't force-pushing
+    if not force and saved and saved.manifest and (saved.since_full or 0) < RECONCILE_EVERY then
+        local envelope = build_delta(saved.sig, sig, saved.manifest, manifest)
+        local since = (saved.since_full or 0) + 1
+        post('/sets/' .. settings.token .. '/delta', envelope, function(success, code)
+            if success then state.sets_pushing = false; save_state(sig, since, manifest)
+            elseif code == 409 then full_push()   -- relay rejected (stale/no base/keyset) -> resync with a full push
+            else state.sets_pushing = false end
+        end)
+    else
+        full_push()
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -297,9 +508,15 @@ local function push_live(force)
     -- event-driven: push ONLY when the set of owned items/augments changed (no heartbeat, no
     -- idle traffic). The local 15s scan is free (it reads the game, not the network).
     if not force and sig == state.last_live_sig then return end
-    local ok, code = http_post('/push/' .. settings.token, body)
-    if ok and (code == 200 or code == 204) then state.last_live_sig = sig
-    elseif force then log('live push failed (' .. tostring(code) .. ')') end
+    if state.live_pushing and (os.time() - (state.live_push_started or 0)) > 90 then state.live_pushing = false end
+    if state.live_pushing then return end
+    state.live_pushing = true
+    state.live_push_started = os.time()
+    post('/push/' .. settings.token, body, function(success, code)
+        state.live_pushing = false
+        if success then state.last_live_sig = sig
+        elseif force then log('live push failed (' .. tostring(code) .. ')') end
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -308,6 +525,9 @@ end
 -- On load, remind you of your code (and keep the recovery file fresh) so a forgotten code
 -- is never a dead end — the pairing persists across sessions, you just need to see it.
 windower.register_event('load', function()
+    math.randomseed(os.time() + math.floor((os.clock() % 1) * 1e6))
+    -- stagger the first sets scan a few seconds so multiboxed clients don't hit it in lockstep
+    state.last_sets_check = os.clock() - settings.sets_interval + 2 + math.random() * 18
     if settings.token ~= '' then
         write_code_file()
         log('paired with code: ' .. settings.token .. '   (//ottoswap code for the pairing link)')

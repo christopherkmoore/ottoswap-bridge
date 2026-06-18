@@ -61,7 +61,7 @@ network** — open the link it gives you on your phone/laptop to pair it there t
 
 ## Requirements
 
-Windower 4 with LuaSec (`ssl.https`) available — the standard install includes it.
+Windower 4 — a standard install already includes the LuaSec and LuaSocket libraries the bridge uses.
 
 ## Status
 
@@ -69,6 +69,10 @@ Live and in active development. The site ([ottoswap.ckmtools.dev](https://ottosw
 browses and analyzes your sets today — stat totals, owned-gear upgrade suggestions, augment
 decoding, and set sharing via link. The relay runs on `ottoswapapi.ckmtools.dev`. New features
 are still landing regularly.
+
+## Issues & feedback
+
+Hit a bug or have a request? Please [open a GitHub issue](https://github.com/christopherkmoore/ottoswap-bridge/issues).
 
 ## Support
 
